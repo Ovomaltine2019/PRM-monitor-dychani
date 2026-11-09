@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitor dýchání (BLE)</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #1d2330; --muted: #6b7385; --line: #dfe3ea;
+    --klid: #2e9e5b; --rychle: #d64545; --nepriloz: #3b7dd8; --treseni: #b03ab0; --alarm: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171d; --card: #1e232c; --text: #e8ebf1; --muted: #9aa3b5; --line: #323946; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.3rem; margin: 8px 0 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; padding: 10px 18px; border-radius: 8px; border: 1px solid var(--line); background: var(--nepriloz); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #spojeni { color: var(--muted); }
+  #stav { font-size: 2rem; font-weight: 700; padding: 22px; border-radius: 10px; text-align: center; color: #fff; background: var(--muted); transition: background .3s; }
+  #doba { text-align: center; color: var(--muted); margin-top: 8px; }
+  canvas { width: 100%; height: 70px; display: block; border-radius: 6px; background: var(--bg); }
+  .legenda { display: flex; gap: 14px; flex-wrap: wrap; font-size: .85rem; color: var(--muted); margin-top: 8px; }
+  .legenda i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  label { display: block; font-size: .9rem; color: var(--muted); }
+  input[type=number] { width: 90px; font: inherit; padding: 6px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .alarm { background: var(--alarm); color: #fff; border-radius: 8px; padding: 10px 14px; margin-top: 10px; font-weight: 600; }
+  small { color: var(--muted); }
+  #log { max-height: 160px; overflow: auto; font-size: .85rem; color: var(--muted); margin: 0; padding-left: 18px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Monitor dýchání – ESP32-S3 přes Bluetooth</h1>
+
+  <div class="card">
+    <div class="row">
+      <button id="tlacitko">Connect</button>
+      <span id="spojeni">Nepřipojeno</span>
+    </div>
+    <p id="podpora" class="alarm" hidden>Tento prohlížeč nepodporuje Web Bluetooth. Použij Chrome nebo Edge (Windows, macOS, Android).</p>
+  </div>
+
+  <div class="card">
+    <div id="stav">–</div>
+    <div id="doba"></div>
+    <div id="alarmy"></div>
+  </div>
+
+  <div class="card">
+    <strong>Časová osa</strong> <small>(posledních 5 minut)</small>
+    <canvas id="osa" width="720" height="70"></canvas>
+    <div class="legenda">
+      <span><i style="background:var(--klid)"></i>klid</span>
+      <span><i style="background:var(--rychle)"></i>rychlé dýchání</span>
+      <span><i style="background:var(--nepriloz)"></i>nepřiložený</span>
+      <span><i style="background:var(--treseni)"></i>třesení</span>
+      <span><i style="background:var(--line)"></i>bez dat / odpojeno</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>Limity alarmů</strong>
+    <div class="row" style="margin-top:8px">
+      <label>Rychlé dýchání déle než [s]<br><input type="number" id="limitRychle" min="1" value="10"></label>
+      <label>Nepřiložený déle než [s]<br><input type="number" id="limitNepriloz" min="1" value="10"></label>
+      <label>Ticho (bez notifikací) déle než [s]<br><input type="number" id="limitTicho" min="2" value="4"></label>
+    </div>
+    <p><small>Pro předvedení jsou limity krátké (10 s). V reálném použití by rychlé dýchání mělo mít limit v řádu minut
+    a nepřiložený senzor v řádu desítek sekund. Rychlé dýchání trvá-li jen chvíli, je to normální (po zátěži), proto
+    alarm až po delší době. Deska posílá stav každou sekundu, výpadek poznáme podle toho, že notifikace přestanou chodit.
+    Alarm ztráty spojení hlásí i okamžité odpojení.</small></p>
+  </div>
+
+  <div class="card">
+    <strong>Události</strong>
+    <ul id="log"></ul>
+  </div>
+</main>
+
+<script>
+// ---------- nastavení (musí odpovídat firmwaru) ----------
+const SLUZBA = "7a1c0001-5b4e-4c3a-9f10-2d5e6b7a8c90";
+const STAV   = "7a1c0002-5b4e-4c3a-9f10-2d5e6b7a8c90";
+const OKNO_OSY_S = 300;   // délka časové osy: 5 minut
+
+const STAVY = {
+  klid:     { nazev: "Klidné dýchání",  barva: "--klid" },
+  rychle:   { nazev: "Rychlé dýchání",  barva: "--rychle" },
+  nepriloz: { nazev: "Nepřiložený",     barva: "--nepriloz" },
+  treseni:  { nazev: "Třesení",         barva: "--treseni" },
+};
+
+// ---------- stav aplikace ----------
+let zarizeni = null, pripojeno = false;
+let aktualni = null;          // název aktuálního stavu
+let odKdy = 0;                // kdy aktuální stav začal [ms]
+let posledniZprava = 0;       // kdy přišla poslední notifikace [ms]
+let useky = [];               // časová osa: {stav, od, do}
+let odpojenoOd = 0;           // kdy se spojení ztratilo (0 = neztraceno)
+let pipnuto = {};             // které alarmy už pípaly (aby nepípaly pořád)
+
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function zapis(text) {
+  const li = document.createElement("li");
+  li.textContent = new Date().toLocaleTimeString("cs-CZ") + "  " + text;
+  $("log").prepend(li);
+}
+
+function pipni() {
+  try {
+    const a = new (window.AudioContext || window.webkitAudioContext)();
+    const o = a.createOscillator(); o.frequency.value = 880; o.connect(a.destination);
+    o.start(); setTimeout(() => { o.stop(); a.close(); }, 300);
+  } catch (e) { /* zvuk není nutný */ }
+}
+
+// ---------- Bluetooth ----------
+async function pripojit() {
+  try {
+    zarizeni = await navigator.bluetooth.requestDevice({ filters: [{ services: [SLUZBA] }] });
+    zarizeni.addEventListener("gattserverdisconnected", pokles);
+    $("spojeni").textContent = "Připojuji…";
+    const server = await zarizeni.gatt.connect();
+    const sluzba = await server.getPrimaryService(SLUZBA);
+    const znak = await sluzba.getCharacteristic(STAV);
+    znak.addEventListener("characteristicvaluechanged", e => prijato(new TextDecoder("utf-8").decode(e.target.value)));
+    await znak.startNotifications();
+    pripojeno = true; odpojenoOd = 0; posledniZprava = Date.now();
+    $("spojeni").textContent = "Připojeno: " + (zarizeni.name || "zařízení");
+    $("tlacitko").textContent = "Odpojit";
+    zapis("Připojeno");
+  } catch (e) {
+    $("spojeni").textContent = "Připojení se nepovedlo: " + e.message;
+    zapis("Chyba připojení: " + e.message);
+  }
+}
+
+function odpojit() { if (zarizeni && zarizeni.gatt.connected) zarizeni.gatt.disconnect(); }
+
+function pokles() {        // událost odpojení (alarm ztráty spojení, 1. část)
+  if (!pripojeno) return;
+  pripojeno = false; odpojenoOd = Date.now();
+  uzavriUsek();
+  aktualni = null;
+  $("spojeni").textContent = "Spojení ztraceno";
+  $("tlacitko").textContent = "Connect";
+  zapis("Odpojeno");
+}
+
+function prijato(text) {
+  const stav = text.trim();
+  posledniZprava = Date.now();
+  if (!STAVY[stav]) return;
+  if (stav !== aktualni) {
+    uzavriUsek();
+    aktualni = stav; odKdy = Date.now();
+    useky.push({ stav, od: odKdy, do: null });
+    pipnuto = {};
+    zapis("Stav: " + STAVY[stav].nazev);
+  }
+}
+
+function uzavriUsek() {
+  const u = useky[useky.length - 1];
+  if (u && u.do === null) u.do = Date.now();
+}
+
+// ---------- vykreslení a alarmy (každých 250 ms) ----------
+function vykresli() {
+  const ted = Date.now();
+
+  // aktuální stav
+  const el = $("stav");
+  if (pripojeno && aktualni) {
+    el.textContent = STAVY[aktualni].nazev;
+    el.style.background = css(STAVY[aktualni].barva);
+    $("doba").textContent = "trvá " + Math.floor((ted - odKdy) / 1000) + " s";
+  } else {
+    el.textContent = pripojeno ? "Čekám na data…" : "Nepřipojeno";
+    el.style.background = css("--muted");
+    $("doba").textContent = "";
+  }
+
+  // alarmy
+  const alarmy = [];
+  const trvani = aktualni ? (ted - odKdy) / 1000 : 0;
+  if (pripojeno && aktualni === "rychle" && trvani > +$("limitRychle").value)
+    alarmy.push(["rychle", `Rychlé dýchání trvá už ${Math.floor(trvani)} s (limit ${$("limitRychle").value} s)`]);
+  if (pripojeno && aktualni === "nepriloz" && trvani > +$("limitNepriloz").value)
+    alarmy.push(["nepriloz", `Senzor je nepřiložený už ${Math.floor(trvani)} s (limit ${$("limitNepriloz").value} s)`]);
+  if (pripojeno && (ted - posledniZprava) / 1000 > +$("limitTicho").value)   // alarm ztráty spojení, 2. část
+    alarmy.push(["ticho", `Žádná data už ${Math.floor((ted - posledniZprava) / 1000)} s (výpadek notifikací)`]);
+  if (!pripojeno && odpojenoOd)
+    alarmy.push(["odpojeno", `Spojení ztraceno před ${Math.floor((ted - odpojenoOd) / 1000)} s`]);
+
+  $("alarmy").innerHTML = "";
+  for (const [id, text] of alarmy) {
+    const d = document.createElement("div"); d.className = "alarm"; d.textContent = "⚠ " + text;
+    $("alarmy").appendChild(d);
+    if (!pipnuto[id]) { pipnuto[id] = true; pipni(); zapis("ALARM: " + text); }
+  }
+
+  kresliOsu(ted);
+}
+
+function kresliOsu(ted) {
+  const c = $("osa"), g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  g.fillStyle = css("--line"); g.fillRect(0, 0, c.width, c.height);   // pozadí = bez dat
+  const od = ted - OKNO_OSY_S * 1000;
+  for (const u of useky) {
+    const a = Math.max(u.od, od), b = u.do === null ? ted : u.do;
+    if (b <= od) continue;
+    const x1 = (a - od) / (OKNO_OSY_S * 1000) * c.width;
+    const x2 = (b - od) / (OKNO_OSY_S * 1000) * c.width;
+    g.fillStyle = css(STAVY[u.stav].barva);
+    g.fillRect(x1, 0, Math.max(x2 - x1, 1), c.height);
+  }
+}
+
+// ---------- spuštění ----------
+if (!navigator.bluetooth) { $("podpora").hidden = false; $("tlacitko").disabled = true; }
+$("tlacitko").addEventListener("click", () => (pripojeno ? odpojit() : pripojit()));
+setInterval(vykresli, 250);
+vykresli();
+</script>
+</body>
+</html>
