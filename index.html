@@ -103,6 +103,7 @@ let posledniZprava = 0;       // kdy přišla poslední notifikace [ms]
 let useky = [];               // časová osa: {stav, od, do}
 let odpojenoOd = 0;           // kdy se spojení ztratilo (0 = neztraceno)
 let pipnuto = {};             // které alarmy už pípaly (aby nepípaly pořád)
+let bpm = null;               // dechy za minutu (null = neplatné)
 
 const $ = id => document.getElementById(id);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -155,7 +156,9 @@ function pokles() {        // událost odpojení (alarm ztráty spojení, 1. č�
 }
 
 function prijato(text) {
-  const stav = text.trim();
+  const casti = text.trim().split(";");          // formát "stav" nebo "stav;dechy_za_minutu", např. "klid;12"
+  const stav = casti[0];
+  bpm = casti.length > 1 ? +casti[1] : null;
   posledniZprava = Date.now();
   if (!STAVY[stav]) return;
   if (stav !== aktualni) {
@@ -181,7 +184,8 @@ function vykresli() {
   if (pripojeno && aktualni) {
     el.textContent = STAVY[aktualni].nazev;
     el.style.background = css(STAVY[aktualni].barva);
-    $("doba").textContent = "trvá " + Math.floor((ted - odKdy) / 1000) + " s";
+    $("doba").textContent = "trvá " + Math.floor((ted - odKdy) / 1000) + " s" +
+      (bpm ? "  ·  dechů za minutu: " + bpm : "");
   } else {
     el.textContent = pripojeno ? "Čekám na data…" : "Nepřipojeno";
     el.style.background = css("--muted");
